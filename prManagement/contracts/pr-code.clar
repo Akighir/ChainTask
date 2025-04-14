@@ -1,5 +1,5 @@
-;; Project Management System 
-;; Blockchain-based project tracking system with deadlines and submission tracking
+;; Project Management System
+;; A blockchain-based project tracking system with sequential tasks and milestone rewards
 
 ;; Constants
 (define-constant ERR-NOT-PROJECT-MANAGER (err u1))
@@ -8,15 +8,16 @@
 (define-constant ERR-ALREADY-COMPLETED (err u4))
 (define-constant ERR-WRONG-DELIVERABLE (err u5))
 (define-constant ERR-DEADLINE-NOT-REACHED (err u6))
-(define-constant ERR-INVALID-PARAMETER (err u7))
-(define-constant ERR-TASK-EXISTS (err u8))
-(define-constant MAX-TASK-ID u75) ;; Maximum allowed task ID
+(define-constant ERR-INSUFFICIENT-BUDGET (err u7))
+(define-constant ERR-INVALID-PARAMETER (err u8))
+(define-constant ERR-TASK-EXISTS (err u9))
+(define-constant MAX-TASK-ID u100) ;; Maximum allowed task ID
 
 ;; Data Variables
 (define-data-var project-manager principal tx-sender)
 (define-data-var project-active bool false)
 (define-data-var current-milestone uint u0)
-(define-data-var onboarding-fee uint u500000) ;; 0.5 STX
+(define-data-var onboarding-fee uint u1000000) ;; 1 STX
 (define-data-var total-budget uint u0)
 (define-data-var current-date uint u0) ;; Date tracking for deadlines
 
@@ -37,7 +38,7 @@
     principal
     {
         current-task: uint,
-        completed-tasks: (list 15 uint),
+        completed-tasks: (list 20 uint),
         last-submission: uint,
         total-completed: uint
     }
@@ -50,6 +51,12 @@
         attempts: uint,
         completed-at: (optional uint)
     }
+)
+
+;; Events
+(define-map task-completions
+    uint
+    (list 10 {member: principal, completed-at: uint})
 )
 
 ;; Authorization
@@ -98,6 +105,9 @@
         ;; Validate description is not empty
         (asserts! (> (len description) u0) ERR-INVALID-PARAMETER)
         
+        ;; Validate reward is a positive amount
+        (asserts! (> reward u0) ERR-INVALID-PARAMETER)
+        
         ;; Set the task data
         (map-set project-tasks task-id
             {
@@ -108,8 +118,12 @@
                 completed: false
             })
             
-        ;; Update the total budget
-        (var-set total-budget (+ (var-get total-budget) reward))
+        ;; Calculate new budget safely
+        (let ((new-budget (+ (var-get total-budget) reward)))
+            ;; Make sure the addition doesn't overflow
+            (asserts! (>= new-budget (var-get total-budget)) ERR-INVALID-PARAMETER)
+            ;; Update the total budget
+            (var-set total-budget new-budget))
         (ok true)))
 
 ;; Team Member Onboarding
@@ -142,50 +156,46 @@
         (asserts! (>= today (get deadline task)) ERR-DEADLINE-NOT-REACHED)
         (asserts! (not (get completed task)) ERR-ALREADY-COMPLETED)
         
-        ;; Get current submission data or default to new
-        (let ((submission-data (default-to 
-                {attempts: u0, completed-at: none} 
-                (map-get? task-submissions {task: task-id, member: tx-sender}))))
-            
-            ;; Verify deliverable - directly compare the hashes
-            (if (is-eq deliverable (get deliverable-hash task))
-                (begin
-                    ;; Update task status
-                    (map-set project-tasks task-id
-                        (merge task {completed: true}))
-                    
-                    ;; Update team member progress
-                    (map-set team-member-progress tx-sender
-                        (merge member {
-                            current-task: (+ task-id u1),
-                            completed-tasks: (unwrap! (as-max-len? 
-                                (append (get completed-tasks member) task-id) u15)
-                                ERR-INVALID-TASK),
-                            last-submission: today,
-                            total-completed: (+ (get total-completed member) u1)
-                        }))
-                    
-                    ;; Record submission
-                    (map-set task-submissions
-                        {task: task-id, member: tx-sender}
-                        {
-                            attempts: (+ (get attempts submission-data) u1),
-                            completed-at: (some today)
-                        })
-                    
-                    ;; Award reward
-                    (try! (stx-transfer? (get reward task) (var-get project-manager) tx-sender))
-                    
-                    (ok true))
-                (begin
-                    ;; Record failed attempt
-                    (map-set task-submissions
-                        {task: task-id, member: tx-sender}
-                        {
-                            attempts: (+ (get attempts submission-data) u1),
-                            completed-at: (get completed-at submission-data)
-                        })
-                    ERR-WRONG-DELIVERABLE)))))
+        ;; Verify deliverable - directly compare the hashes
+        (if (is-eq deliverable (get deliverable-hash task))
+            (begin
+                ;; Update task status
+                (map-set project-tasks task-id
+                    (merge task {completed: true}))
+                
+                ;; Update team member progress
+                (map-set team-member-progress tx-sender
+                    (merge member {
+                        current-task: (+ task-id u1),
+                        completed-tasks: (unwrap! (as-max-len? 
+                            (append (get completed-tasks member) task-id) u20)
+                            ERR-INVALID-TASK),
+                        total-completed: (+ (get total-completed member) u1)
+                    }))
+                
+                ;; Record submission
+                (map-set task-submissions
+                    {task: task-id, member: tx-sender}
+                    {
+                        attempts: u1,
+                        completed-at: (some today)
+                    })
+                
+                ;; Award reward
+                (try! (stx-transfer? (get reward task) (var-get project-manager) tx-sender))
+                
+                ;; Record completion
+                (match (map-get? task-completions task-id)
+                    completions (map-set task-completions task-id
+                        (unwrap! (as-max-len?
+                            (append completions {member: tx-sender, completed-at: today})
+                            u10)
+                            ERR-INVALID-TASK))
+                    (map-set task-completions task-id
+                        (list {member: tx-sender, completed-at: today})))
+                
+                (ok true))
+            ERR-WRONG-DELIVERABLE)))
 
 ;; Read-only functions
 (define-read-only (get-task-description (task-id uint))
@@ -198,8 +208,8 @@
 (define-read-only (get-member-status (member principal))
     (map-get? team-member-progress member))
 
-(define-read-only (get-submission-history (task-id uint) (member principal))
-    (map-get? task-submissions {task: task-id, member: member}))
+(define-read-only (get-task-completions (task-id uint))
+    (map-get? task-completions task-id))
 
 (define-read-only (get-current-date)
     (var-get current-date))
